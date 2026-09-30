@@ -25,7 +25,9 @@ import {
   CircleHelp,
   FileDown,
   FileJson,
+  FileUp,
   GitCompareArrows,
+  GitMerge,
   Keyboard,
   Link2,
   ListTree,
@@ -55,9 +57,20 @@ import {
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  buildAnnotationPackage,
+  confirmPendingAnchor,
+  createAnnotationId,
+  mergeAnnotationPackage,
+  normalizeDocument,
+  parseAnnotationPackage,
+  reconcileDocumentAnchors,
+  resolvePendingDispute
+} from '@/lib/merge';
 import type {
   Annotation,
   AnnotationKind,
+  AnnotationPackage,
   AnchorType,
   ConflictGroup,
   Sentence,
@@ -104,7 +117,9 @@ function buildHtml(document: TextDocument) {
       const sentences = chapter.sentences
         .map((sentence) => {
           const notes = document.annotations.filter(
-            (annotation) => annotation.anchorId === sentence.id && annotation.anchorType === 'sentence'
+            (annotation) =>
+              annotation.anchorId === sentence.id ||
+              sentence.tokens.some((token) => token.id === annotation.anchorId)
           );
           const suffix = notes
             .map((annotation) => `<sup title="${escapeHtml(annotation.title)}">[${escapeHtml(annotation.source)}]</sup>`)
@@ -123,9 +138,14 @@ function buildHtml(document: TextDocument) {
     )
     .join('\n');
 
+  const pendingWarning = document.pendingAnchors.length || document.pendingDisputes.length
+    ? `<p style="color:#9a3412;border:1px solid #fdba74;background:#fff7ed;padding:12px">导出时仍有 ${document.pendingDisputes.length} 条合并争议、${document.pendingAnchors.length} 条词级引用待确认；以下内容为当前合并结果。</p>`
+    : '';
+
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(document.title)}</title>
 <style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}</style></head>
 <body><h1>${escapeHtml(document.title)}</h1><p style="text-align:center">${escapeHtml(document.author)} · ${escapeHtml(document.edition)}</p>
+${pendingWarning}
 ${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
 }
 
@@ -340,6 +360,8 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [mergeReport, setMergeReport] = useState<{ ok: boolean; duplicate?: boolean; messages: string[] } | null>(null);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -364,6 +386,7 @@ export function TextAnnotationWorkbench() {
       if (raw) {
         const stored = JSON.parse(raw) as WorkspaceState;
         if (stored.document?.chapters?.length) {
+          stored.document = normalizeDocument(stored.document);
           dispatch({ type: 'hydrate', workspace: stored });
           if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
         }
@@ -472,13 +495,25 @@ export function TextAnnotationWorkbench() {
   }
 
   function addAnnotation(values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) {
-    const id = `annotation-${Date.now().toString(36)}`;
+    const id = createAnnotationId();
     dispatch({
       type: 'commit',
       label: '新增注释',
       mutate: (doc) => {
+        const origin = values.anchorType === 'word'
+          ? doc.chapters.flatMap((chapter) => chapter.sentences).flatMap((sentence) =>
+              sentence.tokens.map((token, index) => ({ sentence, token, index }))
+            ).find((item) => item.token.id === values.anchorId)
+          : undefined;
         doc.annotations.push({
           ...values,
+          ...(origin
+            ? {
+                originSentenceId: origin.sentence.id,
+                originTokenText: origin.token.text.trim(),
+                originTokenIndex: origin.index
+              }
+            : {}),
           id,
           status: 'open',
           conflictState: 'open',
@@ -535,16 +570,21 @@ export function TextAnnotationWorkbench() {
 
   function applySentenceEdit() {
     if (!editingSentenceId || !editingSentenceDraft.trim()) return;
-    let remapped = 0;
+    let result = { pending: 0, affected: 0 };
+    const previousChapters = clone(document.chapters);
     dispatch({
       type: 'commit',
-      label: '修订句子并保持引用稳定',
+      label: '修订句子并重算词级引用',
       mutate: (doc) => {
-        remapped = updateSentenceText(doc, editingSentenceId, editingSentenceDraft.trim(), tokenizeText);
+        result = updateSentenceText(doc, editingSentenceId, editingSentenceDraft.trim(), tokenizeText, previousChapters);
       }
     });
     setEditingSentenceId(null);
-    if (remapped) setApiMessage(`已修订句子；${remapped} 条词级引用自动迁移到所属句`);
+    if (result.pending) {
+      setApiMessage(`已修订句子；${result.affected} 条词级引用未能确认实际落点，已暂挂所属句并列明影响。`);
+    } else if (result.affected) {
+      setApiMessage(`已修订句子；${result.affected} 条词级引用已重算到实际落点。`);
+    }
   }
 
   function saveVersion() {
@@ -575,8 +615,11 @@ export function TextAnnotationWorkbench() {
       type: 'commit',
       label: `恢复版本：${version.label}`,
       mutate: (doc) => {
+        const previousChapters = clone(doc.chapters);
         doc.chapters = clone(version.chapters);
         doc.annotations = clone(version.annotations);
+        // Restore can make an unresolved word target available again.
+        reconcileDocumentAnchors(doc, previousChapters);
       }
     });
   }
@@ -593,6 +636,12 @@ export function TextAnnotationWorkbench() {
     const leftSentences = new Map(
       left.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => [sentence.id, { chapter, sentence }] as const))
     );
+    const rightSentenceIds = new Set(right.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => sentence.id)));
+    for (const [, entry] of leftSentences) {
+      if (!rightSentenceIds.has(entry.sentence.id)) {
+        changes.push({ id: entry.sentence.id, label: `${entry.chapter.title} · 删除句`, detail: entry.sentence.text });
+      }
+    }
     for (const chapter of right.chapters) {
       for (const sentence of chapter.sentences) {
         const previous = leftSentences.get(sentence.id);
@@ -607,14 +656,85 @@ export function TextAnnotationWorkbench() {
         }
       }
     }
-    const leftAnnotationIds = new Set(left.annotations.map((item) => item.id));
+    const leftAnnotations = new Map(left.annotations.map((item) => [item.id, item]));
+    const rightAnnotationIds = new Set(right.annotations.map((item) => item.id));
     for (const annotation of right.annotations) {
-      if (!leftAnnotationIds.has(annotation.id)) {
+      const previous = leftAnnotations.get(annotation.id);
+      if (!previous) {
         changes.push({ id: annotation.id, label: `新增注释 · ${annotation.title}`, detail: annotation.body });
+      } else if (previous.body !== annotation.body || previous.title !== annotation.title || previous.source !== annotation.source) {
+        changes.push({
+          id: annotation.id,
+          label: `注释改动 · ${annotation.title}`,
+          detail: `${previous.source}：${previous.body} → ${annotation.source}：${annotation.body}`
+        });
+      }
+    }
+    for (const [id, annotation] of leftAnnotations) {
+      if (!rightAnnotationIds.has(id)) {
+        changes.push({ id, label: `删除注释 · ${annotation.title}`, detail: annotation.body });
       }
     }
     return { left, right, changes };
   }, [document, leftVersionId, rightVersionId]);
+
+  function exportPackage() {
+    try {
+      const annotationPackage = buildAnnotationPackage(document);
+      download(`${document.title}-批注包.json`, JSON.stringify(annotationPackage, null, 2), 'application/json;charset=utf-8');
+      setMergeReport({ ok: true, messages: ['批注包已包含共同底本和本机实际改动。'] });
+    } catch (error) {
+      setMergeReport({ ok: false, messages: [error instanceof Error ? error.message : '批注包导出失败。'] });
+    }
+  }
+
+  async function importPackage(file: File) {
+    try {
+      const content = await file.text();
+      const annotationPackage = parseAnnotationPackage(content);
+      const result = mergeAnnotationPackage(document, annotationPackage);
+      if (result.duplicate) {
+        setMergeReport({ ok: true, duplicate: true, messages: ['该批注包已导入过；重复导入不会重复生效。'] });
+        return;
+      }
+      dispatch({ type: 'replaceDocument', label: '离线合并批注包', document: result.document });
+      setMergeReport({
+        ok: true,
+        messages: result.issues.length
+          ? result.issues.map((issue) => issue.message)
+          : ['批注包与当前稿没有实际差异。']
+      });
+      setApiMessage(`已离线合并批注包：${annotationPackage.packageId}`);
+    } catch (error) {
+      const backupKey = `${STORAGE_KEY}/failed-merge/${Date.now()}`;
+      localStorage.setItem(backupKey, JSON.stringify(workspace));
+      setMergeReport({
+        ok: false,
+        messages: [
+          error instanceof Error ? error.message : '批注包合并失败。',
+          `本机草稿已另存为 ${backupKey}，当前内容未替换。`
+        ]
+      });
+    } finally {
+      if (importFileRef.current) importFileRef.current.value = '';
+    }
+  }
+
+  function chooseDispute(disputeId: string, choice: 'local' | 'incoming' | 'combine' | 'delete' | 'keep') {
+    dispatch({
+      type: 'commit',
+      label: '确认合并争议',
+      mutate: (doc) => resolvePendingDispute(doc, disputeId, choice)
+    });
+  }
+
+  function acknowledgeAnchor(pendingId: string, acknowledge: boolean) {
+    dispatch({
+      type: 'commit',
+      label: acknowledge ? '确认暂挂所属句' : '重新定位词级引用',
+      mutate: (doc) => confirmPendingAnchor(doc, pendingId, acknowledge)
+    });
+  }
 
   function exportJson() {
     download(`${document.title}.json`, JSON.stringify(document, null, 2), 'application/json;charset=utf-8');
@@ -791,7 +911,7 @@ export function TextAnnotationWorkbench() {
                 <p className="mt-1 text-sm text-stone-500">{selectedChapter?.summary}</p>
               </div>
               <div className="ml-auto flex flex-wrap justify-end gap-2">
-                <Chip variant="flat" color="warning">{conflicts.length} 处待解冲突</Chip>
+                <Chip variant="flat" color="warning">{conflicts.length + document.pendingDisputes.length + document.pendingAnchors.length} 处待决事项</Chip>
                 <Chip variant="flat">{document.annotations.length} 条注释</Chip>
                 <Button size="sm" variant="flat" startContent={<Printer className="h-4 w-4" />} onPress={() => window.print()}>
                   打印
@@ -968,12 +1088,100 @@ export function TextAnnotationWorkbench() {
                   </ScrollShadow>
                 </Tab>
 
-                <Tab key="conflicts" title={`冲突 ${conflicts.length}`}>
+                <Tab key="conflicts" title={`争议 ${conflicts.length + document.pendingDisputes.length + document.pendingAnchors.length}`}>
                   <ScrollShadow className="max-h-[calc(100vh-210px)]">
                     <div className="space-y-4 pr-1">
                       <div className="rounded-xl bg-red-50 p-3 text-xs leading-5 text-red-800">
-                        系统按“相同引用目标 + 相同注释类型”识别来源冲突。可逐条保留、合并或标记解决，正文引用 ID 不变。
+                        系统按“相同引用目标 + 相同注释类型”识别来源冲突。离线合并中两边都改出的新值会先列为待决；确认前不改来源和引用。
                       </div>
+
+                      {document.pendingAnchors.length ? (
+                        <Card shadow="none" className="border border-amber-200 bg-amber-50/50">
+                          <CardBody className="gap-3 p-3">
+                            <h3 className="flex items-center gap-2 text-sm font-semibold text-amber-900">
+                              <AlertTriangle className="h-4 w-4" />词级引用待确认
+                            </h3>
+                            {document.pendingAnchors.map((pending) => {
+                              const annotation = document.annotations.find((item) => item.id === pending.annotationId);
+                              return (
+                                <div key={pending.id} className="rounded-lg border border-amber-100 bg-white p-3 text-xs leading-5 text-stone-700">
+                                  <b>{annotation?.title ?? pending.annotationId}</b>
+                                  <p className="mt-1">{pending.impact}</p>
+                                  <div className="mt-2 flex flex-wrap gap-2">
+                                    <Button size="sm" color="warning" variant="flat" onPress={() => acknowledgeAnchor(pending.id, false)}>
+                                      重新定位
+                                    </Button>
+                                    <Button size="sm" variant="light" onPress={() => acknowledgeAnchor(pending.id, true)}>
+                                      确认暂挂所属句
+                                    </Button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </CardBody>
+                        </Card>
+                      ) : null}
+
+                      {document.pendingDisputes.length ? (
+                        <Card shadow="none" className="border border-red-200">
+                          <CardBody className="gap-3 p-3">
+                            <h3 className="flex items-center gap-2 text-sm font-semibold text-red-900">
+                              <GitMerge className="h-4 w-4" />离线合并待决争议
+                            </h3>
+                            {document.pendingDisputes.map((dispute) => (
+                              <div key={dispute.id} className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs">
+                                {dispute.type === 'annotation' ? (
+                                  <>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <Chip size="sm" color="danger" variant="flat">
+                                        {dispute.field === 'body' ? '正文新值' : dispute.field === 'source' ? '来源新值' : '标题新值'}
+                                      </Chip>
+                                      <b className="text-stone-900">{dispute.title}</b>
+                                    </div>
+                                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                                      <div className="rounded border border-stone-200 bg-white p-2">
+                                        <b>本机 · {dispute.localSource}</b>
+                                        <p className="mt-1 whitespace-pre-wrap leading-5">{dispute.localValue}</p>
+                                      </div>
+                                      <div className="rounded border border-stone-200 bg-white p-2">
+                                        <b>对方 · {dispute.incomingSource}</b>
+                                        <p className="mt-1 whitespace-pre-wrap leading-5">{dispute.incomingValue}</p>
+                                      </div>
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap gap-2">
+                                      <Button size="sm" color="primary" variant="flat" onPress={() => chooseDispute(dispute.id, 'local')}>保留本机</Button>
+                                      <Button size="sm" color="primary" variant="flat" onPress={() => chooseDispute(dispute.id, 'incoming')}>采用对方</Button>
+                                      {dispute.field !== 'source' ? <Button size="sm" variant="light" onPress={() => chooseDispute(dispute.id, 'combine')}>并列合并</Button> : null}
+                                    </div>
+                                  </>
+                                ) : dispute.type === 'deletion' ? (
+                                  <>
+                                    <b>{dispute.annotation.title}</b>
+                                    <p className="mt-1 leading-5">一侧删除，另一侧仍有修改。当前先保留注释及来源、引用。</p>
+                                    <div className="mt-2 flex gap-2">
+                                      <Button size="sm" variant="light" onPress={() => chooseDispute(dispute.id, 'keep')}>保留注释</Button>
+                                      <Button size="sm" color="danger" variant="flat" onPress={() => chooseDispute(dispute.id, 'delete')}>确认删除并清理引用</Button>
+                                    </div>
+                                  </>
+                                ) : (
+                                  <>
+                                    <b>{dispute.label}</b>
+                                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                                      <div className="rounded border border-stone-200 bg-white p-2"><b>本机</b><p className="mt-1 leading-5">{dispute.localText}</p></div>
+                                      <div className="rounded border border-stone-200 bg-white p-2"><b>对方</b><p className="mt-1 leading-5">{dispute.incomingText}</p></div>
+                                    </div>
+                                    <div className="mt-2 flex gap-2">
+                                      <Button size="sm" variant="light" onPress={() => chooseDispute(dispute.id, 'local')}>保留本机正文</Button>
+                                      <Button size="sm" color="primary" variant="flat" onPress={() => chooseDispute(dispute.id, 'incoming')}>采用对方正文</Button>
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                            ))}
+                          </CardBody>
+                        </Card>
+                      ) : null}
+
                       {conflicts.map((group) => (
                         <Card key={group.key} shadow="none" className="border border-red-100">
                           <CardBody className="gap-3 p-3">
@@ -1000,7 +1208,7 @@ export function TextAnnotationWorkbench() {
                           </CardBody>
                         </Card>
                       ))}
-                      {!conflicts.length ? (
+                      {!conflicts.length && !document.pendingDisputes.length && !document.pendingAnchors.length ? (
                         <div className="grid place-items-center rounded-xl border border-dashed border-green-200 bg-green-50 p-8 text-center">
                           <Check className="h-8 w-8 text-green-600" />
                           <p className="mt-2 text-sm font-medium text-green-800">所有来源冲突均已解决</p>
@@ -1020,6 +1228,36 @@ export function TextAnnotationWorkbench() {
                         <Button className="mt-2 w-full" size="sm" color="primary" variant="flat" onPress={saveVersion} startContent={<Save className="h-4 w-4" />}>
                           保存当前版本
                         </Button>
+                      </div>
+
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900"><GitMerge className="h-4 w-4" />离线批注包</h3>
+                        <p className="mt-2 text-[11px] leading-5 text-stone-500">
+                          导出包携带共同底本；导入时做三方合并，只纳入实际改动。重复包号不会重复生效。
+                        </p>
+                        <div className="mt-3 grid grid-cols-2 gap-2">
+                          <Button size="sm" color="primary" variant="flat" onPress={exportPackage} startContent={<FileUp className="h-4 w-4 rotate-180" />}>
+                            导出批注包
+                          </Button>
+                          <Button size="sm" variant="flat" onPress={() => importFileRef.current?.click()} startContent={<FileUp className="h-4 w-4" />}>
+                            导入并合并
+                          </Button>
+                          <input
+                            ref={importFileRef}
+                            type="file"
+                            accept="application/json,.json"
+                            className="hidden"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              if (file) void importPackage(file);
+                            }}
+                          />
+                        </div>
+                        {mergeReport ? (
+                          <div className={`mt-3 rounded-lg border p-2 text-[11px] leading-5 ${mergeReport.ok ? 'border-green-200 bg-green-50 text-green-800' : 'border-red-200 bg-red-50 text-red-800'}`}>
+                            {mergeReport.messages.map((message) => <p key={message}>{message}</p>)}
+                          </div>
+                        ) : null}
                       </div>
 
                       <div className="grid grid-cols-2 gap-2">

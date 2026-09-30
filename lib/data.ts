@@ -97,14 +97,36 @@ function tokenId(chapter: number, sentenceIndex: number, index: number) {
   return `sentence-${chapter}-${sentenceIndex + 1}-token-${index}`;
 }
 
-function findTokenId(sentenceId: string, text: string) {
+function findToken(sentenceId: string, text: string) {
   const target = chapters.flatMap((chapter) => chapter.sentences).find((item) => item.id === sentenceId);
-  return target?.tokens.find((token) => token.text.includes(text))?.id ?? target?.id ?? sentenceId;
+  if (!target) return { id: sentenceId, text, sentenceId, index: -1 };
+  const meaningful = target.tokens
+    .map((token, index) => ({ token, index }))
+    .filter((item) => item.token.text.trim());
+
+  let start = meaningful.findIndex((item) => item.token.text.includes(text));
+  if (start < 0) {
+    for (let index = 0; index < meaningful.length; index += 1) {
+      for (let end = index + 1; end <= meaningful.length; end += 1) {
+        if (meaningful.slice(index, end).map((item) => item.token.text).join('') === text) {
+          start = index;
+          break;
+        }
+      }
+      if (start >= 0) break;
+    }
+  }
+  return start >= 0
+    ? { id: meaningful[start].token.id, text, sentenceId: target.id, index: meaningful[start].index }
+    : { id: target.id, text, sentenceId: target.id, index: -1 };
 }
 
-const pengId = findTokenId('sentence-1-3', '鹏');
-const mingId = findTokenId('sentence-1-1', '北冥');
-const bianId = findTokenId('sentence-3-2', '辩');
+const pengToken = findToken('sentence-1-3', '鹏');
+const mingToken = findToken('sentence-1-1', '北冥');
+const bianToken = findToken('sentence-3-2', '辩');
+const pengId = pengToken.id;
+const mingId = mingToken.id;
+const bianId = bianToken.id;
 
 const annotations: Annotation[] = [
   {
@@ -147,7 +169,10 @@ const annotations: Annotation[] = [
     status: 'open',
     tags: ['异文', '字形'],
     conflictState: 'open',
-    updatedAt: FIXED_TIME
+    updatedAt: FIXED_TIME,
+    originSentenceId: pengToken.sentenceId,
+    originTokenText: pengToken.text,
+    originTokenIndex: pengToken.index
   },
   {
     id: 'annotation-4',
@@ -161,7 +186,10 @@ const annotations: Annotation[] = [
     status: 'open',
     tags: ['意象'],
     conflictState: 'open',
-    updatedAt: FIXED_TIME
+    updatedAt: FIXED_TIME,
+    originSentenceId: pengToken.sentenceId,
+    originTokenText: pengToken.text,
+    originTokenIndex: pengToken.index
   },
   {
     id: 'annotation-5',
@@ -175,7 +203,10 @@ const annotations: Annotation[] = [
     status: 'open',
     tags: ['互见'],
     conflictState: 'open',
-    updatedAt: FIXED_TIME
+    updatedAt: FIXED_TIME,
+    originSentenceId: mingToken.sentenceId,
+    originTokenText: mingToken.text,
+    originTokenIndex: mingToken.index
   },
   {
     id: 'annotation-6',
@@ -217,7 +248,10 @@ const annotations: Annotation[] = [
     status: 'open',
     tags: ['异体字'],
     conflictState: 'open',
-    updatedAt: FIXED_TIME
+    updatedAt: FIXED_TIME,
+    originSentenceId: bianToken.sentenceId,
+    originTokenText: bianToken.text,
+    originTokenIndex: bianToken.index
   },
   {
     id: 'annotation-9',
@@ -234,6 +268,13 @@ const annotations: Annotation[] = [
     updatedAt: FIXED_TIME
   }
 ];
+
+const initialBase = {
+  id: 'base-initial',
+  createdAt: FIXED_TIME,
+  chapters: structuredClone(chapters),
+  annotations: structuredClone(annotations)
+};
 
 const initialSnapshot: VersionSnapshot = {
   id: 'snapshot-base',
@@ -252,6 +293,11 @@ export const initialDocument: TextDocument = {
   chapters,
   annotations,
   snapshots: [initialSnapshot],
+  bases: [initialBase],
+  baseId: initialBase.id,
+  pendingDisputes: [],
+  pendingAnchors: [],
+  appliedPackageIds: [],
   updatedAt: FIXED_TIME
 };
 

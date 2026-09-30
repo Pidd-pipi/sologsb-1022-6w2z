@@ -1,6 +1,7 @@
 import type {
   Annotation,
   AnnotationKind,
+  Chapter,
   ConflictGroup,
   EditorState,
   SearchResult,
@@ -8,6 +9,7 @@ import type {
   TextDocument,
   WorkspaceState
 } from './types';
+import { reconcileDocumentAnchors } from './merge';
 
 export const STORAGE_KEY = 'sologsb-1022/public-text-annotator/v1';
 
@@ -48,6 +50,7 @@ function pushHistory(state: EditorState, next: WorkspaceState, label: string): E
 export type EditorAction =
   | { type: 'hydrate'; workspace: WorkspaceState }
   | { type: 'commit'; label: string; mutate: (document: TextDocument) => void }
+  | { type: 'replaceDocument'; label: string; document: TextDocument }
   | { type: 'selectChapter'; chapterId: string }
   | { type: 'selectSentence'; chapterId: string; sentenceId: string }
   | { type: 'selectAnnotation'; annotationId: string | null }
@@ -70,6 +73,14 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       action.mutate(next.document);
       next.document.updatedAt = new Date().toISOString();
       next.dirty = true;
+      return pushHistory(state, next, action.label);
+    }
+    case 'replaceDocument': {
+      const next = {
+        ...clone(state.workspace),
+        document: clone(action.document),
+        dirty: true
+      };
       return pushHistory(state, next, action.label);
     }
     case 'selectChapter': {
@@ -153,6 +164,8 @@ export function getTargetLabel(document: TextDocument, annotation: Annotation): 
     }
   }
 
+  const pending = document.pendingAnchors.find((item) => item.annotationId === annotation.id);
+  if (pending) return `词语“${pending.tokenText}”待确认 · 暂挂所属句`;
   return '引用目标已迁移到所属句';
 }
 
@@ -266,28 +279,27 @@ export function updateSentenceText(
   document: TextDocument,
   sentenceId: string,
   text: string,
-  tokenize: (value: string, id: string, existing: Sentence['tokens']) => Sentence['tokens']
-) {
-  let remappedAnnotations = 0;
+  tokenize: (value: string, id: string, existing: Sentence['tokens']) => Sentence['tokens'],
+  previousChapters: Chapter[] = document.chapters
+): { pending: number; affected: number } {
+  const affected = document.annotations.filter(
+    (annotation) =>
+      annotation.originSentenceId === sentenceId ||
+      (annotation.anchorType === 'word' &&
+        previousChapters.flatMap((chapter) => chapter.sentences).find((item) => item.id === sentenceId)?.tokens.some((token) => token.id === annotation.anchorId))
+  ).length;
+
   for (const chapter of document.chapters) {
     const sentence = chapter.sentences.find((item) => item.id === sentenceId);
     if (!sentence) continue;
-    const previousIds = new Set(sentence.tokens.map((token) => token.id));
     sentence.text = text;
     sentence.tokens = tokenize(text, sentence.id, sentence.tokens);
-    const remainingIds = new Set(sentence.tokens.map((token) => token.id));
-
-    for (const annotation of document.annotations) {
-      if (annotation.anchorType === 'word' && previousIds.has(annotation.anchorId) && !remainingIds.has(annotation.anchorId)) {
-        annotation.anchorId = sentence.id;
-        annotation.anchorType = 'sentence';
-        annotation.title = `${annotation.title}（引用已随修订迁移）`;
-        remappedAnnotations += 1;
-      }
-    }
     break;
   }
-  return remappedAnnotations;
+
+  reconcileDocumentAnchors(document, previousChapters);
+  const pending = document.pendingAnchors.filter((item) => item.sentenceId === sentenceId).length;
+  return { pending, affected };
 }
 
 export function removeAnnotationReferences(document: TextDocument, removedId: string) {

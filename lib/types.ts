@@ -37,6 +37,106 @@ export interface Annotation {
   conflictState: 'open' | 'resolved';
   conflictResolution?: string;
   updatedAt: string;
+  originSentenceId?: string;
+  originTokenText?: string;
+  originTokenIndex?: number;
+}
+
+export type MergeDisputeField = 'body' | 'source' | 'title';
+
+export interface MergeDispute {
+  id: string;
+  type: 'annotation';
+  field: MergeDisputeField;
+  annotationId: string;
+  title: string;
+  kind: AnnotationKind;
+  anchorId: string;
+  anchorType: AnchorType;
+  localValue: string;
+  incomingValue: string;
+  baseValue: string;
+  localSource: string;
+  incomingSource: string;
+  packageId: string;
+  deviceId: string;
+  createdAt: string;
+  status: 'pending';
+}
+
+export interface DeletionDispute {
+  id: string;
+  type: 'deletion';
+  annotationId: string;
+  annotation: Annotation;
+  packageId: string;
+  deviceId: string;
+  createdAt: string;
+  status: 'pending';
+}
+
+export interface TextDispute {
+  id: string;
+  type: 'text';
+  sentenceId: string;
+  chapterId: string;
+  label: string;
+  localText: string;
+  incomingText: string;
+  baseText: string;
+  baseTokens: TextToken[];
+  packageId: string;
+  deviceId: string;
+  createdAt: string;
+  status: 'pending';
+}
+
+export type PendingDispute = MergeDispute | DeletionDispute | TextDispute;
+
+export interface PendingAnchor {
+  id: string;
+  annotationId: string;
+  sentenceId: string;
+  tokenText: string;
+  tokenIndex: number;
+  reason: 'not-found';
+  impact: string;
+  createdAt: string;
+  status: 'pending';
+}
+
+export interface MergeBaseSnapshot {
+  id: string;
+  createdAt: string;
+  chapters: Chapter[];
+  annotations: Annotation[];
+}
+
+export interface AnnotationPackage {
+  format: 'sologsb.annotation-package/v1';
+  packageId: string;
+  deviceId: string;
+  exportedAt: string;
+  baseId: string;
+  base: MergeBaseSnapshot;
+  chapters: Chapter[];
+  annotations: Annotation[];
+  deletedAnnotationIds: string[];
+  deletedSentenceIds: string[];
+}
+
+export type MergeIssueKind = 'added-annotation' | 'changed-annotation' | 'text' | 'pending-anchor' | 'dispute' | 'deleted-annotation';
+
+export interface MergeIssue {
+  kind: MergeIssueKind;
+  message: string;
+}
+
+export interface MergeResult {
+  document: TextDocument;
+  applied: boolean;
+  duplicate: boolean;
+  issues: MergeIssue[];
 }
 
 export interface VersionSnapshot {
@@ -56,6 +156,11 @@ export interface TextDocument {
   chapters: Chapter[];
   annotations: Annotation[];
   snapshots: VersionSnapshot[];
+  bases: MergeBaseSnapshot[];
+  baseId: string;
+  pendingDisputes: PendingDispute[];
+  pendingAnchors: PendingAnchor[];
+  appliedPackageIds: string[];
   updatedAt: string;
 }
 
