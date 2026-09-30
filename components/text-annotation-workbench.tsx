@@ -26,6 +26,7 @@ import {
   FileDown,
   FileJson,
   GitCompareArrows,
+  GitMerge,
   Keyboard,
   Link2,
   ListTree,
@@ -55,11 +56,15 @@ import {
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import { computeBaseDigest, createPackageId, mergePackageIntoDocument, resolveMergePending } from '@/lib/merge';
+import { MergePanel } from '@/components/merge-panel';
 import type {
   Annotation,
   AnnotationKind,
+  AnnotationPackage,
   AnchorType,
   ConflictGroup,
+  MergeResolution,
   Sentence,
   TextDocument,
   ViewMode,
@@ -87,6 +92,21 @@ function download(filename: string, content: string, type: string) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+const DEVICE_ID_KEY = 'sologsb-1022/public-text-annotator/device-id';
+
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (!id) {
+      id = `device-${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem(DEVICE_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    return 'device-unknown';
+  }
 }
 
 function escapeHtml(value: string) {
@@ -340,6 +360,7 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [mergeMessage, setMergeMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -349,6 +370,10 @@ export function TextAnnotationWorkbench() {
   const selectedSentence = getSentence(document, workspace.selectedSentenceId);
   const conflicts = useMemo(() => getConflictGroups(document), [document]);
   const searchResults = useMemo(() => collectSearchResults(document, workspace.query), [document, workspace.query]);
+  const pendingMergeCount = useMemo(
+    () => (document.mergePending ?? []).filter((item) => item.status === 'pending').length,
+    [document.mergePending]
+  );
 
   const anchor = pendingAnchor ?? {
     id: selectedSentence?.id ?? selectedChapter?.id ?? '',
@@ -472,7 +497,7 @@ export function TextAnnotationWorkbench() {
   }
 
   function addAnnotation(values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) {
-    const id = `annotation-${Date.now().toString(36)}`;
+    const id = `annotation-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     dispatch({
       type: 'commit',
       label: '新增注释',
@@ -622,6 +647,56 @@ export function TextAnnotationWorkbench() {
 
   function exportHtml() {
     download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
+  }
+
+  function exportPackage() {
+    const pkg: AnnotationPackage = {
+      packageId: createPackageId(),
+      deviceId: getDeviceId(),
+      exportedAt: new Date().toISOString(),
+      baseDigest: computeBaseDigest(document),
+      baseLabel: document.snapshots[0]?.label ?? '整理底本',
+      document: clone(document)
+    };
+    download(`批注包-${document.title}.json`, JSON.stringify(pkg, null, 2), 'application/json;charset=utf-8');
+    setMergeMessage({ ok: true, text: '批注包已导出，携带共同底本摘要与本机完整草稿。' });
+  }
+
+  function handleImportFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const pkg = JSON.parse(String(reader.result)) as AnnotationPackage;
+        if (!pkg || typeof pkg !== 'object' || !pkg.document || !Array.isArray(pkg.document.chapters) || typeof pkg.baseDigest !== 'string') {
+          setMergeMessage({ ok: false, text: '批注包格式不正确，已保留本机草稿，未导入任何改动。' });
+          return;
+        }
+        const { document: merged, outcome } = mergePackageIntoDocument(document, pkg);
+        if (!outcome.ok) {
+          setMergeMessage({ ok: false, text: outcome.error ?? '合并失败，已保留本机草稿。' });
+          return;
+        }
+        if (outcome.note) {
+          setMergeMessage({ ok: true, text: outcome.note });
+          return;
+        }
+        dispatch({ type: 'mergeDocument', document: merged, label: `导入批注包：${pkg.deviceId}` });
+        const stats = outcome.stats;
+        setMergeMessage({
+          ok: true,
+          text: `合并完成：新增注释 ${stats?.newAnnotations ?? 0} 条，并入远端改动 ${stats?.updatedAnnotations ?? 0} 条，待决争议 ${stats?.disputes ?? 0} 项，引用待确认 ${stats?.pendingCitations ?? 0} 条。版本对比与导出将读取合并结果。`
+        });
+      } catch {
+        setMergeMessage({ ok: false, text: '批注包解析失败，已保留本机草稿，未导入任何改动。' });
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function handleResolve(pendingId: string, resolution: MergeResolution) {
+    const { document: resolved, outcome } = resolveMergePending(document, pendingId, resolution);
+    dispatch({ type: 'mergeDocument', document: resolved, label: '处理离线合并待决事项' });
+    setMergeMessage({ ok: true, text: outcome });
   }
 
   const mode = workspace.mode;
@@ -1080,6 +1155,31 @@ export function TextAnnotationWorkbench() {
                       </div>
                       <p className="text-[11px] leading-5 text-stone-500">{apiMessage}</p>
                     </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab
+                  key="merge"
+                  title={
+                    <span className="flex items-center gap-1.5">
+                      <GitMerge className="h-3.5 w-3.5" />
+                      离线合并
+                      {pendingMergeCount ? (
+                        <Chip size="sm" color="danger" variant="flat" className="h-4 min-w-4 px-1 text-[10px]">
+                          {pendingMergeCount}
+                        </Chip>
+                      ) : null}
+                    </span>
+                  }
+                >
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <MergePanel
+                      document={document}
+                      message={mergeMessage}
+                      onExport={exportPackage}
+                      onImportFile={handleImportFile}
+                      onResolve={handleResolve}
+                    />
                   </ScrollShadow>
                 </Tab>
               </Tabs>

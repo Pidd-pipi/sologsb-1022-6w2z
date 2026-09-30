@@ -48,6 +48,7 @@ function pushHistory(state: EditorState, next: WorkspaceState, label: string): E
 export type EditorAction =
   | { type: 'hydrate'; workspace: WorkspaceState }
   | { type: 'commit'; label: string; mutate: (document: TextDocument) => void }
+  | { type: 'mergeDocument'; document: TextDocument; label: string }
   | { type: 'selectChapter'; chapterId: string }
   | { type: 'selectSentence'; chapterId: string; sentenceId: string }
   | { type: 'selectAnnotation'; annotationId: string | null }
@@ -68,6 +69,13 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     case 'commit': {
       const next = clone(state.workspace);
       action.mutate(next.document);
+      next.document.updatedAt = new Date().toISOString();
+      next.dirty = true;
+      return pushHistory(state, next, action.label);
+    }
+    case 'mergeDocument': {
+      const next = clone(state.workspace);
+      next.document = clone(action.document);
       next.document.updatedAt = new Date().toISOString();
       next.dirty = true;
       return pushHistory(state, next, action.label);

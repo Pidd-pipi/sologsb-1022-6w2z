@@ -57,6 +57,48 @@ export interface TextDocument {
   annotations: Annotation[];
   snapshots: VersionSnapshot[];
   updatedAt: string;
+  mergePending?: MergePendingItem[];
+  importedPackages?: ImportedPackageRecord[];
+}
+
+export interface AnnotationPackage {
+  packageId: string;
+  deviceId: string;
+  exportedAt: string;
+  baseDigest: string;
+  baseLabel: string;
+  document: TextDocument;
+}
+
+export type MergePendingKind = 'annotation-body' | 'annotation-delete' | 'sentence-text' | 'word-citation';
+export type MergePendingStatus = 'pending' | 'resolved';
+export type MergeResolution = 'local' | 'remote' | 'base' | 'migrate-sentence' | 'keep';
+
+export interface MergePendingItem {
+  id: string;
+  kind: MergePendingKind;
+  status: MergePendingStatus;
+  anchorId: string;
+  anchorType: AnchorType;
+  annotationId?: string;
+  sentenceId?: string;
+  chapterId?: string;
+  targetLabel: string;
+  baseValue?: string;
+  localValue?: string;
+  remoteValue?: string;
+  payload?: string;
+  impact: string;
+  tokenText?: string;
+  resolution?: MergeResolution;
+  resolvedAt?: string;
+  createdAt: string;
+}
+
+export interface ImportedPackageRecord {
+  packageId: string;
+  deviceId: string;
+  importedAt: string;
 }
 
 export interface WorkspaceState {
